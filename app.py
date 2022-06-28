@@ -2,6 +2,7 @@ from RPi import GPIO
 from time import sleep
 from queue import Queue, Empty
 from typing import Union
+from datetime import datetime
 
 import uvicorn
 from fastapi import FastAPI
@@ -29,6 +30,11 @@ SW_GPIO = 2
 DT_GPIO = 3
 CLK_GPIO = 4
 
+FADE_TIME_SECONDS = 0.75
+FADE_TIME = FADE_TIME_SECONDS * 1000000
+INTERVALS = 300
+R = max((INTERVALS * math.log(2,10)) / math.log(255,10), 0.1)
+
 isHeld = False
 singlePress = False
 
@@ -41,17 +47,21 @@ class Adjustment(BaseModel):
     green: int = 0
     blue: int = 0
     white: int = 0
+    fade_time: int = FADE_TIME
 
 class State(BaseModel):
-    red: int
-    green: int
-    blue: int
-    white: int
-    on: bool
-    power: int
+    red: int = 0
+    green: int = 0
+    blue: int = 0
+    white: int = 100
+    on: bool = True
+    power: int = 100
 
     def duplicate(self):
         return State(red=self.red, green=self.green, blue=self.blue, white=self.white, on=self.on, power=self.power)
+
+class StateChange(State):
+    fade_time: int = FADE_TIME
 
 def bound(low, high, value):
     return max(low, min(high, value))
@@ -65,6 +75,9 @@ def loadState():
         state = State(red=stateJson["red"], green=stateJson["green"], blue=stateJson["blue"], white=stateJson["white"], on=stateJson["on"], power=stateJson["power"])
         f.close()
         return state
+
+def getStateChange(state: State):
+    return StateChange(red=state.red, green=state.green, blue=state.blue, white=state.white, on=state.on, power=state.power)
 
 def saveState(state: State):
     with open('./state.json', 'w') as f:
@@ -86,20 +99,8 @@ async def switch():
     #FIXME: This can be old state if transition to off/on is still happening
     state = loadState()
     state.on = not state.on
-    q.put(state)
+    q.put(getStateChange(state))
     return "On" if state.on else "Off"
-
-@app.post('/tweak_power', status_code=200)
-async def tweak_power(adjustment: Power):
-    global q
-    state = loadState()
-    if state.on:
-        state.power = bound(0, 1.0, state.power + adjustment.value)
-    else:
-        state.on = True
-        state.power = bound(0, 1.0, adjustment.value)
-    q.put(state)
-    return "{0}, {5}% power: (r:{1}, g:{2}, b:{3}, w:{4})".format("ON" if state.on else "OFF", state.red, state.green, state.blue, state.white, state.power * 100)
 
 @app.post('/tweak_state', status_code=200)
 async def tweak_state(adjustment: Adjustment):
@@ -108,6 +109,7 @@ async def tweak_state(adjustment: Adjustment):
     adjustment.green = bound(-100, 100, adjustment.green)
     adjustment.blue = bound(-100, 100, adjustment.blue)
     adjustment.white = bound(-100, 100, adjustment.white)
+    adjustment.fade_time = 0.1 * 1000000
 
     q.put(adjustment)
 
@@ -121,7 +123,7 @@ async def get_state():
 async def set_state(newState: State):
     global q
     state = newState
-    q.put(state)
+    q.put(getStateChange(state))
     return newState
 
 @app.on_event("shutdown")
@@ -172,12 +174,9 @@ class Fade(Thread):
                 sleep(0.1)
                 continue
 
+            startTime = datetime.utcnow()
             startState = currentState.duplicate()
             effectiveStartPower = startState.power if startState.on else 0
-            print(effectiveStartPower)
-            print(startState)
-            print(effectiveTargetPower)
-            print(targetState)
 
             redDiff = abs(targetState.red * effectiveTargetPower - startState.red * effectiveStartPower)
             greenDiff = abs(targetState.green * effectiveTargetPower - startState.green * effectiveStartPower)
@@ -185,54 +184,55 @@ class Fade(Thread):
             whiteDiff = abs(targetState.white * effectiveTargetPower - startState.white * effectiveStartPower)
             maxDiff = max(redDiff, max(greenDiff, max(blueDiff, whiteDiff)))
 
-            # FIXME: Make this time based rather than iterations
-            intervals = round(maxDiff / 10000 * 255)
-            print(intervals)
-            # intervals = 255
-            R = max((intervals * math.log(2,10)) / math.log(255,10), 0.1)
-            for x in range(intervals + 1):
+            dt = datetime.utcnow() - startTime
+            while dt.microseconds <= task.fade_time:
                 if(self.stopped() or not q.empty()):
                     # Have to put this in loop to ensure on gets set
                     currentState.on = targetState.on
                     saveState(currentState)
                     print("Broke early")
                     break
-                increasingC = (2.0 ** (x / self.R) - 1) / 255.0
-                decreasingC = 1.0 - ((2.0 ** ((self.intervals - x) / self.R) - 1) / 255.0)
 
-                # redC = increasingC if self.targetRed > self.startRed else decreasingC
-                # greenC = increasingC if self.targetGreen > self.startGreen else decreasingC
-                # blueC = increasingC if self.targetBlue > self.startBlue else decreasingC
-                # whiteC = increasingC if self.targetWhite > self.startWhite else decreasingC
-                # powerC = increasingC if self.targetPower > self.startPower else decreasingC
+                dt = datetime.utcnow() - startTime
+                currentInterval = math.floor(min(1.0, dt.microseconds / task.fade_time) * INTERVALS)
 
-                redC = decreasingC
-                greenC = decreasingC
-                blueC = decreasingC
-                whiteC = decreasingC
-                powerC = decreasingC
+                increasingC = (2.0 ** (currentInterval / R) - 1) / 255.0
+                decreasingC = 1.0 - ((2.0 ** ((INTERVALS - currentInterval) / R) - 1) / 255.0)
 
-                if x != intervals:
-                    currentState.red = bound(0, 100, lerp(startState.red, targetState.red, redC))
-                    currentState.green = bound(0, 100, lerp(startState.green, targetState.green, greenC))
-                    currentState.blue = bound(0, 100, lerp(startState.blue, targetState.blue, blueC))
-                    currentState.white = bound(0, 100, lerp(startState.white, targetState.white, whiteC))
-                    currentState.power = bound(0, 100, lerp(startState.power, targetState.power, powerC))
-                    effectiveCurrentPower = bound(0, 100, lerp(effectiveStartPower, effectiveTargetPower, powerC))
-                else:
-                    currentState.red = bound(0, 100, targetState.red)
-                    currentState.green = bound(0, 100, targetState.green)
-                    currentState.blue = bound(0, 100, targetState.blue)
-                    currentState.white = bound(0, 100, targetState.white)
-                    currentState.power = bound(0, 100, targetState.power)
-                    effectiveCurrentPower = effectiveTargetPower
-                    currentState.on = targetState.on
-                    saveState(targetState)
+                redC = increasingC if targetState.red > startState.red else decreasingC
+                greenC = increasingC if targetState.green > startState.green else decreasingC
+                blueC = increasingC if targetState.blue > startState.blue else decreasingC
+                whiteC = increasingC if targetState.white > startState.white else decreasingC
+                powerC = increasingC if targetState.power > startState.power else decreasingC
+
+                currentState.red = bound(0, 100, lerp(startState.red, targetState.red, redC))
+                currentState.green = bound(0, 100, lerp(startState.green, targetState.green, greenC))
+                currentState.blue = bound(0, 100, lerp(startState.blue, targetState.blue, blueC))
+                currentState.white = bound(0, 100, lerp(startState.white, targetState.white, whiteC))
+                currentState.power = bound(0, 100, lerp(startState.power, targetState.power, powerC))
+                effectiveCurrentPower = bound(0, 100, lerp(effectiveStartPower, effectiveTargetPower, powerC))
 
                 pi.set_PWM_dutycycle(RED_GPIO, (currentState.red * effectiveCurrentPower * 255)/10000)
                 pi.set_PWM_dutycycle(GREEN_GPIO, (currentState.green * effectiveCurrentPower * 255)/10000)
                 pi.set_PWM_dutycycle(BLUE_GPIO, (currentState.blue * effectiveCurrentPower * 255)/10000)
                 pi.set_PWM_dutycycle(WHITE_GPIO, (currentState.white * effectiveCurrentPower * 255)/10000)
+
+            if q.empty():
+                # task.fade_time has elapsed, ensure target is reached
+                currentState.red = bound(0, 100, targetState.red)
+                currentState.green = bound(0, 100, targetState.green)
+                currentState.blue = bound(0, 100, targetState.blue)
+                currentState.white = bound(0, 100, targetState.white)
+                currentState.power = bound(0, 100, targetState.power)
+                effectiveCurrentPower = effectiveTargetPower
+                currentState.on = targetState.on
+                saveState(targetState)
+
+                pi.set_PWM_dutycycle(RED_GPIO, (currentState.red * effectiveCurrentPower * 255)/10000)
+                pi.set_PWM_dutycycle(GREEN_GPIO, (currentState.green * effectiveCurrentPower * 255)/10000)
+                pi.set_PWM_dutycycle(BLUE_GPIO, (currentState.blue * effectiveCurrentPower * 255)/10000)
+                pi.set_PWM_dutycycle(WHITE_GPIO, (currentState.white * effectiveCurrentPower * 255)/10000)
+
 
 
 def check_double_click():
@@ -241,7 +241,7 @@ def check_double_click():
     state = loadState()
     if singlePress:
         state.on = not state.on
-        q.put(state)
+        q.put(getStateChange(state))
         singlePress = False
 
 def button_held(channel):
@@ -249,13 +249,8 @@ def button_held(channel):
     global q
     state = loadState()
     isHeld = True
-    state.red = 0
-    state.green = 0
-    state.blue = 0
-    state.white = 100
-    state.on = True
-    state.power = 100
-    q.put(state)
+    change = StateChange()
+    q.put(change)
 
 def button_released(channel):
     global isHeld
@@ -271,11 +266,11 @@ def button_released(channel):
 
 def clockwise_rotation(channel):
     global q
-    q.put(Adjustment(power=10))
+    q.put(Adjustment(power=10, fade_time=0.1 * 1000000))
 
 def counter_clockwise_rotation(channel):
     global q
-    q.put(Adjustment(power=-10))
+    q.put(Adjustment(power=-10, fade_time=0.1 * 1000000))
 
 q = Queue()
 fadeThread = Fade()
