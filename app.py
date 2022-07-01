@@ -152,13 +152,17 @@ class Fade(Thread):
                 return
             try:
                 task = q.get_nowait()
+                startState = currentState.duplicate()
                 if type(task) is Adjustment:
                     print("Adjustment")
                     targetState.red = bound(0, 100, targetState.red + task.red) if currentState.on else task.red
                     targetState.green = bound(0, 100, targetState.green + task.green) if currentState.on else task.green
                     targetState.blue = bound(0, 100, targetState.blue + task.blue) if currentState.on else task.blue
                     targetState.white = bound(0, 100, targetState.white + task.white) if currentState.on else task.white
-                    targetState.power = bound(0, 100, targetState.power + task.power)
+                    if startState.on:
+                        targetState.power = bound(0, 100, targetState.power + task.power)
+                    else:
+                        targetState.power = bound(0, 100, 10)
                     targetState.on = True
                     effectiveTargetPower = targetState.power if targetState.on else 0
                 else:
@@ -175,13 +179,37 @@ class Fade(Thread):
                 continue
 
             startTime = datetime.utcnow()
-            startState = currentState.duplicate()
-            effectiveStartPower = startState.power if startState.on else 0
+            if not startState.on:
+                startState.red = 0
+                startState.green = 0
+                startState.blue = 0
+                startState.white = 0
+                startState.power = 0
 
-            redDiff = abs(targetState.red * effectiveTargetPower - startState.red * effectiveStartPower)
-            greenDiff = abs(targetState.green * effectiveTargetPower - startState.green * effectiveStartPower)
-            blueDiff = abs(targetState.blue * effectiveTargetPower - startState.blue * effectiveStartPower)
-            whiteDiff = abs(targetState.white * effectiveTargetPower - startState.white * effectiveStartPower)
+            maxStartColourVal = max(startState.red, max(startState.green, max(startState.blue, startState.white)))
+            if maxStartColourVal != 0:
+                startState.red = startState.red / maxStartColourVal * 100
+                startState.green = startState.green / maxStartColourVal * 100
+                startState.blue = startState.blue / maxStartColourVal * 100
+                startState.white = startState.white / maxStartColourVal * 100
+
+            # Scale targetState so highest colour is considered max
+            maxTargetColourVal = max(targetState.red, max(targetState.green, max(targetState.blue, targetState.white)))
+            if maxTargetColourVal == 0:
+                effectiveTargetRed = 0
+                effectiveTargetGreen = 0
+                effectiveTargetBlue = 0
+                effectiveTargetWhite = 0
+            else:
+                effectiveTargetRed = targetState.red / maxTargetColourVal * 100
+                effectiveTargetGreen = targetState.green / maxTargetColourVal * 100
+                effectiveTargetBlue = targetState.blue / maxTargetColourVal * 100
+                effectiveTargetWhite = targetState.white / maxTargetColourVal * 100
+
+            redDiff = abs(effectiveTargetRed * effectiveTargetPower - startState.red * startState.power)
+            greenDiff = abs(effectiveTargetGreen * effectiveTargetPower - startState.green * startState.power)
+            blueDiff = abs(effectiveTargetBlue * effectiveTargetPower - startState.blue * startState.power)
+            whiteDiff = abs(effectiveTargetWhite * effectiveTargetPower - startState.white * startState.power)
             maxDiff = max(redDiff, max(greenDiff, max(blueDiff, whiteDiff)))
 
             dt = datetime.utcnow() - startTime
@@ -199,10 +227,10 @@ class Fade(Thread):
                 increasingC = (2.0 ** (currentInterval / R) - 1) / 255.0
                 decreasingC = 1.0 - ((2.0 ** ((INTERVALS - currentInterval) / R) - 1) / 255.0)
 
-                redC = increasingC if targetState.red > startState.red else decreasingC
-                greenC = increasingC if targetState.green > startState.green else decreasingC
-                blueC = increasingC if targetState.blue > startState.blue else decreasingC
-                whiteC = increasingC if targetState.white > startState.white else decreasingC
+                redC = increasingC if effectiveTargetRed > startState.red else decreasingC
+                greenC = increasingC if effectiveTargetGreen > startState.green else decreasingC
+                blueC = increasingC if effectiveTargetBlue > startState.blue else decreasingC
+                whiteC = increasingC if effectiveTargetWhite > startState.white else decreasingC
                 powerC = increasingC if targetState.power > startState.power else decreasingC
 
                 currentState.red = bound(0, 100, lerp(startState.red, targetState.red, redC))
@@ -210,12 +238,17 @@ class Fade(Thread):
                 currentState.blue = bound(0, 100, lerp(startState.blue, targetState.blue, blueC))
                 currentState.white = bound(0, 100, lerp(startState.white, targetState.white, whiteC))
                 currentState.power = bound(0, 100, lerp(startState.power, targetState.power, powerC))
-                effectiveCurrentPower = bound(0, 100, lerp(effectiveStartPower, effectiveTargetPower, powerC))
 
-                pi.set_PWM_dutycycle(RED_GPIO, (currentState.red * effectiveCurrentPower * 255)/10000)
-                pi.set_PWM_dutycycle(GREEN_GPIO, (currentState.green * effectiveCurrentPower * 255)/10000)
-                pi.set_PWM_dutycycle(BLUE_GPIO, (currentState.blue * effectiveCurrentPower * 255)/10000)
-                pi.set_PWM_dutycycle(WHITE_GPIO, (currentState.white * effectiveCurrentPower * 255)/10000)
+                effectiveCurrentRed = bound(0, 100, lerp(startState.red, effectiveTargetRed, redC))
+                effectiveCurrentGreen = bound(0, 100, lerp(startState.green, effectiveTargetGreen, greenC))
+                effectiveCurrentBlue = bound(0, 100, lerp(startState.blue, effectiveTargetBlue, blueC))
+                effectiveCurrentWhite = bound(0, 100, lerp(startState.white, effectiveTargetWhite, whiteC))
+                effectiveCurrentPower = bound(0, 100, lerp(startState.power, effectiveTargetPower, powerC))
+
+                pi.set_PWM_dutycycle(RED_GPIO, (effectiveCurrentRed * effectiveCurrentPower * 255)/10000)
+                pi.set_PWM_dutycycle(GREEN_GPIO, (effectiveCurrentGreen * effectiveCurrentPower * 255)/10000)
+                pi.set_PWM_dutycycle(BLUE_GPIO, (effectiveCurrentBlue * effectiveCurrentPower * 255)/10000)
+                pi.set_PWM_dutycycle(WHITE_GPIO, (effectiveCurrentWhite * effectiveCurrentPower * 255)/10000)
 
             if q.empty():
                 # task.fade_time has elapsed, ensure target is reached
@@ -224,14 +257,13 @@ class Fade(Thread):
                 currentState.blue = bound(0, 100, targetState.blue)
                 currentState.white = bound(0, 100, targetState.white)
                 currentState.power = bound(0, 100, targetState.power)
-                effectiveCurrentPower = effectiveTargetPower
                 currentState.on = targetState.on
                 saveState(targetState)
 
-                pi.set_PWM_dutycycle(RED_GPIO, (currentState.red * effectiveCurrentPower * 255)/10000)
-                pi.set_PWM_dutycycle(GREEN_GPIO, (currentState.green * effectiveCurrentPower * 255)/10000)
-                pi.set_PWM_dutycycle(BLUE_GPIO, (currentState.blue * effectiveCurrentPower * 255)/10000)
-                pi.set_PWM_dutycycle(WHITE_GPIO, (currentState.white * effectiveCurrentPower * 255)/10000)
+                pi.set_PWM_dutycycle(RED_GPIO, (effectiveTargetRed * effectiveTargetPower * 255)/10000)
+                pi.set_PWM_dutycycle(GREEN_GPIO, (effectiveTargetGreen * effectiveTargetPower * 255)/10000)
+                pi.set_PWM_dutycycle(BLUE_GPIO, (effectiveTargetBlue * effectiveTargetPower * 255)/10000)
+                pi.set_PWM_dutycycle(WHITE_GPIO, (effectiveTargetWhite * effectiveTargetPower * 255)/10000)
 
 
 
