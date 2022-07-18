@@ -1,12 +1,11 @@
-from RPi import GPIO
 from time import sleep
 from queue import Queue, Empty
-from typing import Union
-from datetime import datetime
+from datetime import datetime, timedelta
+from enum import Enum
 
 import uvicorn
 from fastapi import FastAPI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 import pigpio
 import math
@@ -30,27 +29,40 @@ SW_GPIO = 2
 DT_GPIO = 3
 CLK_GPIO = 4
 
-FADE_TIME_SECONDS = 0.75
-FADE_TIME = FADE_TIME_SECONDS * 1000000
+class KnobState(Enum):
+    DEFAULT = 1
+    MOD_RED = 2
+    MOD_GREEN = 3
+    MOD_BLUE = 4
+    MOD_WHITE = 5
+
+FADE_TIME = 0.75
+KNOB_TIMEOUT_SECONDS = 10
 INTERVALS = 300
 R = max((INTERVALS * math.log(2,10)) / math.log(255,10), 0.1)
 
+knobTimeout = datetime.utcnow()
+knobState = KnobState.DEFAULT
 isHeld = False
 singlePress = False
 
-class Power(BaseModel):
+class Task(BaseModel):
+    fadeTime: float = 0
+    postDelay: float = 0
+    flash: bool = False
+
+class Power(Task):
     value: int
 
-class Adjustment(BaseModel):
+class Adjustment(Task):
     power: int = 0
     red: int = 0
     green: int = 0
     blue: int = 0
     white: int = 0
-    fade_time: int = 0
 
-class Switch(BaseModel):
-    fade_time: int = FADE_TIME
+class Switch(Task):
+    pass
 
 class State(BaseModel):
     red: int = 0
@@ -62,6 +74,9 @@ class State(BaseModel):
 
     def duplicate(self):
         return State(red=self.red, green=self.green, blue=self.blue, white=self.white, on=self.on, power=self.power)
+
+class StateChange(State, Task):
+    pass
 
 def getEffectivePower(state: State):
     return state.power if state.on else 0
@@ -124,9 +139,6 @@ def applyTask(task, currentTarget):
         targetState.on = task.on
     return targetState
 
-class StateChange(State):
-    fade_time: int = FADE_TIME
-
 def bound(low, high, value):
     return max(low, min(high, value))
 
@@ -140,8 +152,8 @@ def loadState():
         f.close()
         return state
 
-def getStateChange(state: State):
-    return StateChange(red=state.red, green=state.green, blue=state.blue, white=state.white, on=state.on, power=state.power)
+def getStateChange(state: State = State(), task: Task = Task()):
+    return StateChange(red=state.red, green=state.green, blue=state.blue, white=state.white, on=state.on, power=state.power, flash=task.flash, fadeTime=task.fadeTime, postDelay=task.postDelay)
 
 def saveState(state: State):
     with open('./state.json', 'w') as f:
@@ -216,6 +228,7 @@ class Fade(Thread):
 
         while True:
             if(self.stopped()):
+                print("Stopping")
                 return
             try:
                 task = q.get_nowait()
@@ -225,6 +238,7 @@ class Fade(Thread):
                 startBlue = pi.get_PWM_dutycycle(BLUE_GPIO)
                 startWhite = pi.get_PWM_dutycycle(WHITE_GPIO)
 
+                initialState = targetState.duplicate()
                 targetState = applyTask(task, targetState)
                 targetRed = getPwmRed(targetState)
                 targetGreen = getPwmGreen(targetState)
@@ -236,13 +250,13 @@ class Fade(Thread):
 
             startTime = datetime.utcnow()
             dt = datetime.utcnow() - startTime
-            while dt.microseconds <= task.fade_time:
+            while dt.total_seconds() <= task.fadeTime:
                 if(self.stopped() or not q.empty()):
                     print("Broke early")
                     break
 
                 dt = datetime.utcnow() - startTime
-                currentInterval = INTERVALS if task.fade_time == 0 else math.floor(min(1.0, dt.microseconds / task.fade_time) * INTERVALS)
+                currentInterval = INTERVALS if task.fadeTime == 0 else math.floor(min(1.0, dt.total_seconds() / task.fadeTime) * INTERVALS)
 
                 increasingC = (2.0 ** (currentInterval / R) - 1) / 255.0
                 decreasingC = 1.0 - ((2.0 ** ((INTERVALS - currentInterval) / R) - 1) / 255.0)
@@ -257,48 +271,125 @@ class Fade(Thread):
                 pi.set_PWM_dutycycle(BLUE_GPIO, lerp(startBlue, targetBlue, blueC))
                 pi.set_PWM_dutycycle(WHITE_GPIO, lerp(startWhite, targetWhite, whiteC))
 
-            saveState(targetState)
-
-            if dt.microseconds > task.fade_time:
-                # task.fade_time has elapsed, ensure target is reached
+            if dt.total_seconds() > task.fadeTime:
+                # task.fadeTime has elapsed, ensure target is reached
                 pi.set_PWM_dutycycle(RED_GPIO, targetRed)
                 pi.set_PWM_dutycycle(GREEN_GPIO, targetGreen)
                 pi.set_PWM_dutycycle(BLUE_GPIO, targetBlue)
                 pi.set_PWM_dutycycle(WHITE_GPIO, targetWhite)
 
+            if task.flash:
+                sleep(task.postDelay)
+                q.put(getStateChange(initialState, Task(fadeTime = task.fadeTime)))
+            else:
+                saveState(targetState)
+
+def check_knob_timeout():
+    global knobTimeout
+    global knobState
+    global q
+    now = datetime.utcnow()
+    if knobTimeout <= now:
+        knobState = KnobState.DEFAULT
+        q.put(Adjustment(power=-50, flash=True, fadeTime=0.15))
+    else:
+        Timer((knobTimeout - now).total_seconds(), check_knob_timeout).start()
+
 def check_double_click():
+    global knobState
+    global knobTimeout
     global singlePress
     global q
+
     if singlePress:
-        q.put(Switch())
         singlePress = False
+        if knobState == KnobState.DEFAULT:
+            q.put(Switch(fadeTime=FADE_TIME))
+        else:
+            if knobState == KnobState.MOD_RED:
+                q.put(Adjustment(red=-100, green=100, blue=-100, white=-100, flash=True, postDelay=0.25))
+                knobState = KnobState.MOD_GREEN
+            elif knobState == KnobState.MOD_GREEN:
+                q.put(Adjustment(red=-100, green=-100, blue=100, white=-100, flash=True, postDelay=0.25))
+                knobState = KnobState.MOD_BLUE
+            elif knobState == KnobState.MOD_BLUE:
+                q.put(Adjustment(red=-100, green=-100, blue=-100, white=100, flash=True, postDelay=0.25))
+                knobState = KnobState.MOD_WHITE
+            else:
+                q.put(Adjustment(red=100, green=-100, blue=-100, white=-100, flash=True, postDelay=0.25))
+                knobState = KnobState.MOD_RED
+            knobTimeout = datetime.utcnow() + timedelta(seconds = KNOB_TIMEOUT_SECONDS)
 
-def button_held(channel):
+def button_held():
     global isHeld
     global q
+    global knobState
     isHeld = True
-    change = StateChange()
-    q.put(change)
+    if knobState != KnobState.DEFAULT:
+        knobState = KnobState.DEFAULT
+        q.put(Adjustment(power=-50, flash=True, fadeTime=0.15))
+    else:
+        q.put(getStateChange(task = Task(fadeTime=FADE_TIME)))
 
-def button_released(channel):
+def button_released():
     global isHeld
     global singlePress
+    global knobState
+    global knobTimeout
 
     if not isHeld:
         if singlePress:
+            # Double click has occurred
             singlePress = False
+            if knobState == KnobState.DEFAULT:
+                knobState = KnobState.MOD_RED
+                q.put(Adjustment(red=100, green=-100, blue=-100, white=-100, flash=True, postDelay=0.25))
+                knobTimeout = datetime.utcnow() + timedelta(seconds = KNOB_TIMEOUT_SECONDS)
+                Timer(KNOB_TIMEOUT_SECONDS, check_knob_timeout).start()
+            else:
+                knobState = KnobState.DEFAULT
+                q.put(Adjustment(power=-50, flash=True, fadeTime=0.15))
         else:
+            # Single click has occurred
             singlePress = True
             Timer(DOUBLE_CLICK_TIME, check_double_click).start()
     isHeld = False
 
-def clockwise_rotation(channel):
+def clockwise_rotation():
     global q
-    q.put(Adjustment(power=10))
+    global knobState
+    global knobTimeout
 
-def counter_clockwise_rotation(channel):
+    if knobState == KnobState.DEFAULT:
+        q.put(Adjustment(power=10))
+    else:
+        knobTimeout = datetime.utcnow() + timedelta(seconds = KNOB_TIMEOUT_SECONDS)
+        if knobState == KnobState.MOD_RED:
+            q.put(Adjustment(red=5))
+        elif knobState == KnobState.MOD_GREEN:
+            q.put(Adjustment(green=5))
+        elif knobState == KnobState.MOD_BLUE:
+            q.put(Adjustment(blue=5))
+        elif knobState == KnobState.MOD_WHITE:
+            q.put(Adjustment(white=5))
+
+def counter_clockwise_rotation():
     global q
-    q.put(Adjustment(power=-10))
+    global knobState
+    global knobTimeout
+
+    if knobState == KnobState.DEFAULT:
+        q.put(Adjustment(power=-10))
+    else:
+        knobTimeout = datetime.utcnow() + timedelta(seconds = KNOB_TIMEOUT_SECONDS)
+        if knobState == KnobState.MOD_RED:
+            q.put(Adjustment(red=-5))
+        elif knobState == KnobState.MOD_GREEN:
+            q.put(Adjustment(green=-5))
+        elif knobState == KnobState.MOD_BLUE:
+            q.put(Adjustment(blue=-5))
+        elif knobState == KnobState.MOD_WHITE:
+            q.put(Adjustment(white=-5))
 
 q = Queue()
 fadeThread = Fade()
