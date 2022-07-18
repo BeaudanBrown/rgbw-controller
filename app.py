@@ -2,6 +2,7 @@ from time import sleep
 from queue import Queue, Empty
 from datetime import datetime, timedelta
 from enum import Enum
+from typing import Optional
 
 import uvicorn
 from fastapi import FastAPI
@@ -76,7 +77,12 @@ class State(BaseModel):
         return State(red=self.red, green=self.green, blue=self.blue, white=self.white, on=self.on, power=self.power)
 
 class StateChange(State, Task):
-    pass
+    red: Optional[int] = None
+    green: Optional[int] = None
+    blue: Optional[int] = None
+    white: Optional[int] = None
+    on: Optional[bool] = None
+    power: Optional[int] = None
 
 def getEffectivePower(state: State):
     return state.power if state.on else 0
@@ -131,12 +137,12 @@ def applyTask(task, currentTarget):
 
     else:
         # StateChange
-        targetState.red = bound(0, 100, task.red)
-        targetState.green = bound(0, 100, task.green)
-        targetState.blue = bound(0, 100, task.blue)
-        targetState.white = bound(0, 100, task.white)
-        targetState.power = bound(0, 100, task.power)
-        targetState.on = task.on
+        targetState.red = currentTarget.red if task.red is None else bound(0, 100, task.red)
+        targetState.green = currentTarget.green if task.green is None else bound(0, 100, task.green)
+        targetState.blue = currentTarget.blue if task.blue is None else bound(0, 100, task.blue)
+        targetState.white = currentTarget.white if task.white is None else bound(0, 100, task.white)
+        targetState.power = currentTarget.power if task.power is None else bound(0, 100, task.power)
+        targetState.on = currentTarget.on if task.on is None else task.on
     return targetState
 
 def bound(low, high, value):
@@ -173,7 +179,7 @@ def saveState(state: State):
 async def switch():
     global q
     isOn = (pi.get_PWM_dutycycle(RED_GPIO) + pi.get_PWM_dutycycle(GREEN_GPIO) + pi.get_PWM_dutycycle(BLUE_GPIO) + pi.get_PWM_dutycycle(WHITE_GPIO)) > 0
-    q.put(Switch())
+    q.put(Switch(fadeTime=FADE_TIME))
     # FIXME: This can be incorrect if switched on and off quickly
     return "ON" if not isOn else "OFF"
 
@@ -290,8 +296,9 @@ def check_knob_timeout():
     global q
     now = datetime.utcnow()
     if knobTimeout <= now:
-        knobState = KnobState.DEFAULT
-        q.put(Adjustment(power=-50, flash=True, fadeTime=0.15))
+        if knobState != KnobState.DEFAULT:
+            knobState = KnobState.DEFAULT
+            q.put(StateChange(power=10, flash=True, fadeTime=0.15))
     else:
         Timer((knobTimeout - now).total_seconds(), check_knob_timeout).start()
 
@@ -307,16 +314,16 @@ def check_double_click():
             q.put(Switch(fadeTime=FADE_TIME))
         else:
             if knobState == KnobState.MOD_RED:
-                q.put(Adjustment(red=-100, green=100, blue=-100, white=-100, flash=True, postDelay=0.25))
+                q.put(StateChange(red=0, green=100, blue=0, white=0, flash=True, postDelay=0.25))
                 knobState = KnobState.MOD_GREEN
             elif knobState == KnobState.MOD_GREEN:
-                q.put(Adjustment(red=-100, green=-100, blue=100, white=-100, flash=True, postDelay=0.25))
+                q.put(StateChange(red=0, green=0, blue=100, white=0, flash=True, postDelay=0.25))
                 knobState = KnobState.MOD_BLUE
             elif knobState == KnobState.MOD_BLUE:
-                q.put(Adjustment(red=-100, green=-100, blue=-100, white=100, flash=True, postDelay=0.25))
+                q.put(StateChange(red=0, green=0, blue=0, white=100, flash=True, postDelay=0.25))
                 knobState = KnobState.MOD_WHITE
             else:
-                q.put(Adjustment(red=100, green=-100, blue=-100, white=-100, flash=True, postDelay=0.25))
+                q.put(StateChange(red=100, green=0, blue=0, white=0, flash=True, postDelay=0.25))
                 knobState = KnobState.MOD_RED
             knobTimeout = datetime.utcnow() + timedelta(seconds = KNOB_TIMEOUT_SECONDS)
 
@@ -327,7 +334,7 @@ def button_held():
     isHeld = True
     if knobState != KnobState.DEFAULT:
         knobState = KnobState.DEFAULT
-        q.put(Adjustment(power=-50, flash=True, fadeTime=0.15))
+        q.put(StateChange(power=10, flash=True, fadeTime=0.15))
     else:
         q.put(getStateChange(task = Task(fadeTime=FADE_TIME)))
 
@@ -343,12 +350,12 @@ def button_released():
             singlePress = False
             if knobState == KnobState.DEFAULT:
                 knobState = KnobState.MOD_RED
-                q.put(Adjustment(red=100, green=-100, blue=-100, white=-100, flash=True, postDelay=0.25))
+                q.put(StateChange(red=100, green=0, blue=0, white=0, flash=True, postDelay=0.25))
                 knobTimeout = datetime.utcnow() + timedelta(seconds = KNOB_TIMEOUT_SECONDS)
                 Timer(KNOB_TIMEOUT_SECONDS, check_knob_timeout).start()
             else:
                 knobState = KnobState.DEFAULT
-                q.put(Adjustment(power=-50, flash=True, fadeTime=0.15))
+                q.put(StateChange(power=10, flash=True, fadeTime=0.15))
         else:
             # Single click has occurred
             singlePress = True
