@@ -4,7 +4,6 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Optional
 
-import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
 
@@ -84,30 +83,14 @@ class StateChange(State, Task):
     on: Optional[bool] = None
     power: Optional[int] = None
 
-def getEffectivePower(state: State):
+def getEffectivePower(state: State) -> int:
     return state.power if state.on else 0
 
-def getPwmRed(state: State):
-    maxColourVal = max(state.red, max(state.green, max(state.blue, state.white)))
-    effectiveRed = 0 if maxColourVal == 0 else state.red / maxColourVal * 100
-    return bound(0, 255, (effectiveRed * getEffectivePower(state) * 255) / 10000)
+def getPwmColour(maxColourVal: int, effectivePower: int, colourVal: int) -> int:
+    effectiveColour = 0 if maxColourVal == 0 else colourVal / maxColourVal * 100
+    return bound(0, 255, (effectiveColour * effectivePower * 255) / 10000)
 
-def getPwmGreen(state: State):
-    maxColourVal = max(state.red, max(state.green, max(state.blue, state.white)))
-    effectiveGreen = 0 if maxColourVal == 0 else state.green / maxColourVal * 100
-    return bound(0, 255, (effectiveGreen * getEffectivePower(state) * 255) / 10000)
-
-def getPwmBlue(state: State):
-    maxColourVal = max(state.red, max(state.green, max(state.blue, state.white)))
-    effectiveBlue = 0 if maxColourVal == 0 else state.blue / maxColourVal * 100
-    return bound(0, 255, (effectiveBlue * getEffectivePower(state) * 255) / 10000)
-
-def getPwmWhite(state: State):
-    maxColourVal = max(state.red, max(state.green, max(state.blue, state.white)))
-    effectiveWhite = 0 if maxColourVal == 0 else state.white / maxColourVal * 100
-    return bound(0, 255, (effectiveWhite * getEffectivePower(state) * 255) / 10000)
-
-def applyTask(task, currentTarget):
+def applyTask(task, currentTarget: State) -> State:
     targetState = currentTarget.duplicate()
     if type(task) is Adjustment:
         if currentTarget.on or (task.red <= 0 and task.green <= 0 and task.blue <= 0 and task.white <= 0):
@@ -146,7 +129,7 @@ def applyTask(task, currentTarget):
     return targetState
 
 def bound(low, high, value):
-    return max(low, min(high, value))
+    return int(max(low, min(high, value)))
 
 def lerp(A, B, C):
     return A + C * (B - A)
@@ -227,10 +210,12 @@ class Fade(Thread):
     def run(self):
         # Make sure PWM dutycycle is always set at least once
         targetState = loadState()
-        pi.set_PWM_dutycycle(RED_GPIO, getPwmRed(targetState))
-        pi.set_PWM_dutycycle(GREEN_GPIO, getPwmGreen(targetState))
-        pi.set_PWM_dutycycle(BLUE_GPIO, getPwmBlue(targetState))
-        pi.set_PWM_dutycycle(WHITE_GPIO, getPwmWhite(targetState))
+        maxColourVal = max(targetState.red, max(targetState.green, max(targetState.blue, targetState.white)))
+        effectivePower = getEffectivePower(targetState)
+        pi.set_PWM_dutycycle(RED_GPIO, getPwmColour(maxColourVal, effectivePower, targetState.red))
+        pi.set_PWM_dutycycle(GREEN_GPIO, getPwmColour(maxColourVal, effectivePower, targetState.green))
+        pi.set_PWM_dutycycle(BLUE_GPIO, getPwmColour(maxColourVal, effectivePower, targetState.blue))
+        pi.set_PWM_dutycycle(WHITE_GPIO, getPwmColour(maxColourVal, effectivePower, targetState.white))
 
         while True:
             if(self.stopped()):
@@ -246,10 +231,12 @@ class Fade(Thread):
 
                 initialState = targetState.duplicate()
                 targetState = applyTask(task, targetState)
-                targetRed = getPwmRed(targetState)
-                targetGreen = getPwmGreen(targetState)
-                targetBlue = getPwmBlue(targetState)
-                targetWhite = getPwmWhite(targetState)
+                maxColourVal = max(targetState.red, max(targetState.green, max(targetState.blue, targetState.white)))
+                effectivePower = getEffectivePower(targetState)
+                targetRed = getPwmColour(maxColourVal, effectivePower, targetState.red)
+                targetGreen = getPwmColour(maxColourVal, effectivePower, targetState.green)
+                targetBlue = getPwmColour(maxColourVal, effectivePower, targetState.blue)
+                targetWhite = getPwmColour(maxColourVal, effectivePower, targetState.white)
             except Empty:
                 sleep(0.1)
                 continue
