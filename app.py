@@ -19,7 +19,7 @@ app = FastAPI()
 pi = pigpio.pi()
 
 HOLD_TIME = 0.5
-DOUBLE_CLICK_TIME = 0.2
+DOUBLE_CLICK_TIME = 0.4
 RED_GPIO = 26
 GREEN_GPIO = 19
 BLUE_GPIO = 13
@@ -301,16 +301,16 @@ def check_double_click():
             q.put(Switch(fadeTime=FADE_TIME))
         else:
             if knobState == KnobState.MOD_RED:
-                q.put(StateChange(red=0, green=100, blue=0, white=0, flash=True, postDelay=0.25))
+                q.put(StateChange(red=0, green=100, blue=0, white=0, flash=True, postDelay=0.5, fadeTime=0.25))
                 knobState = KnobState.MOD_GREEN
             elif knobState == KnobState.MOD_GREEN:
-                q.put(StateChange(red=0, green=0, blue=100, white=0, flash=True, postDelay=0.25))
+                q.put(StateChange(red=0, green=0, blue=100, white=0, flash=True, postDelay=0.5, fadeTime=0.25))
                 knobState = KnobState.MOD_BLUE
             elif knobState == KnobState.MOD_BLUE:
-                q.put(StateChange(red=0, green=0, blue=0, white=100, flash=True, postDelay=0.25))
+                q.put(StateChange(red=0, green=0, blue=0, white=100, flash=True, postDelay=0.5, fadeTime=0.25))
                 knobState = KnobState.MOD_WHITE
             else:
-                q.put(StateChange(red=100, green=0, blue=0, white=0, flash=True, postDelay=0.25))
+                q.put(StateChange(red=100, green=0, blue=0, white=0, flash=True, postDelay=0.5, fadeTime=0.25))
                 knobState = KnobState.MOD_RED
             knobTimeout = datetime.utcnow() + timedelta(seconds = KNOB_TIMEOUT_SECONDS)
 
@@ -337,7 +337,7 @@ def button_released():
             singlePress = False
             if knobState == KnobState.DEFAULT:
                 knobState = KnobState.MOD_RED
-                q.put(StateChange(red=100, green=0, blue=0, white=0, flash=True, postDelay=0.25))
+                q.put(StateChange(red=100, green=0, blue=0, white=0, flash=True, postDelay=0.5, fadeTime=0.25))
                 knobTimeout = datetime.utcnow() + timedelta(seconds = KNOB_TIMEOUT_SECONDS)
                 Timer(KNOB_TIMEOUT_SECONDS, check_knob_timeout).start()
             else:
