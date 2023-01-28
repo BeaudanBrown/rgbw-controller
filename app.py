@@ -64,16 +64,20 @@ class Adjustment(Task):
     power: int = 0
     colour: Colour = Colour()
 
+class ChangePreset(Task):
+    pass
+
 class Switch(Task):
     pass
 
 class State(BaseModel):
-    colour: Colour = Colour()
     on: bool = True
     power: int = 100
+    presets: list[Colour] = [Colour(white=100)]
+    presetIdx: int = 0
 
     def duplicate(self):
-        return State(colour=self.colour, on=self.on, power=self.power)
+        return State(presets=self.presets, presetIdx=self.presetIdx, on=self.on, power=self.power)
 
 class StateChange(State, Task):
     red: Optional[int] = None
@@ -93,17 +97,19 @@ def getPwmColour(maxColourVal: int, effectivePower: int, colourVal: int) -> int:
 def applyTask(task, currentTarget: State) -> State:
     targetState = currentTarget.duplicate()
     if type(task) is Adjustment:
+        newColour = targetState.presets[targetState.presetIdx]
         if currentTarget.on or (task.colour.red <= 0 and task.colour.green <= 0 and task.colour.blue <= 0 and task.colour.white <= 0):
-            targetState.colour.red = bound(0, 100, currentTarget.colour.red + task.colour.red)
-            targetState.colour.green = bound(0, 100, currentTarget.colour.green + task.colour.green)
-            targetState.colour.blue = bound(0, 100, currentTarget.colour.blue + task.colour.blue)
-            targetState.colour.white = bound(0, 100, currentTarget.colour.white + task.colour.white)
+            newColour.red = bound(0, 100, newColour.red + task.colour.red)
+            newColour.green = bound(0, 100, newColour.green + task.colour.green)
+            newColour.blue = bound(0, 100, newColour.blue + task.colour.blue)
+            newColour.white = bound(0, 100, newColour.white + task.colour.white)
         else:
             # Just set target to the adjustment if we are currently off and have increased a colour
-            targetState.colour.red = task.colour.red
-            targetState.colour.green = task.colour.green
-            targetState.colour.blue = task.colour.blue
-            targetState.colour.white = task.colour.white
+            newColour.red = task.colour.red
+            newColour.green = task.colour.green
+            newColour.blue = task.colour.blue
+            newColour.white = task.colour.white
+        targetState.presets[targetState.presetIdx] = newColour
         targetState.on = True
         if currentTarget.on:
             targetState.power = bound(0, 100, currentTarget.power + task.power)
@@ -120,12 +126,17 @@ def applyTask(task, currentTarget: State) -> State:
 
     elif type(task) is StateChange:
         # StateChange
-        targetState.colour.red = currentTarget.red if task.red is None else bound(0, 100, task.red)
-        targetState.colour.green = currentTarget.green if task.green is None else bound(0, 100, task.green)
-        targetState.colour.blue = currentTarget.blue if task.blue is None else bound(0, 100, task.blue)
-        targetState.colour.white = currentTarget.white if task.white is None else bound(0, 100, task.white)
+        newColour = Colour(
+            red = currentTarget.presets[currentTarget.presetIdx].red if task.red is None else bound(0, 100, task.red),
+            green = currentTarget.presets[currentTarget.presetIdx].green if task.green is None else bound(0, 100, task.green),
+            blue = currentTarget.presets[currentTarget.presetIdx].blue if task.blue is None else bound(0, 100, task.blue),
+            white = currentTarget.presets[currentTarget.presetIdx].white if task.white is None else bound(0, 100, task.white),
+        )
+        targetState.presets[targetState.presetIdx] = newColour
         targetState.power = currentTarget.power if task.power is None else bound(0, 100, task.power)
         targetState.on = currentTarget.on if task.on is None else task.on
+    elif type(task) is ChangePreset:
+        targetState.presetIdx = (targetState.presetIdx + 1) % 3
     else:
         print("Unknown task type")
     return targetState
@@ -139,28 +150,31 @@ def lerp(A, B, C):
 def loadState():
     with open('./state.json', 'r') as f:
         stateJson = json.load(f)
-        state = State(colour=Colour(red=stateJson["colour"]["red"], green=stateJson["colour"]["green"], blue=stateJson["colour"]["blue"], white=stateJson["colour"]["white"]), on=stateJson["on"], power=stateJson["power"])
+        presets = list(map(lambda preset : Colour(red=preset["red"], green=preset["green"], blue=preset["blue"], white=preset["white"]), stateJson["presets"]))
+        state = State(presets=presets, presetIdx=stateJson["presetIdx"], on=stateJson["on"], power=stateJson["power"])
         f.close()
         return state
 
 def getStateChange(state: State = State(), task: Task = Task()):
-    return StateChange(red=state.colour.red, green=state.colour.green, blue=state.colour.blue, white=state.colour.white, on=state.on, power=state.power, flash=task.flash, fadeTime=task.fadeTime, postDelay=task.postDelay)
+    activeColour = state.presets[state.presetIdx]
+    return StateChange(red=activeColour.red, green=activeColour.green, blue=activeColour.blue, white=activeColour.white, on=state.on, power=state.power, flash=task.flash, fadeTime=task.fadeTime, postDelay=task.postDelay)
 
 def saveState(state: State):
     with open('./state.json', 'w') as f:
         stateDict = {
-            "colour": {
-                "red": state.colour.red,
-                "green": state.colour.green,
-                "blue": state.colour.blue,
-                "white": state.colour.white,
-            },
             "on": state.on,
             "power": state.power,
+            "presets": list(map(lambda colour : { "red": colour.red, "green": colour.green, "blue": colour.blue, "white": colour.white, }, state.presets)),
+            "presetIdx": state.presetIdx,
         }
         json.dump(stateDict, f)
         f.close()
         return
+
+@app.post('/change_preset', status_code=200)
+async def change_preset():
+    global q
+    q.put(ChangePreset(fadeTime=0.25))
 
 @app.post('/switch', status_code=200)
 async def switch():
@@ -184,7 +198,8 @@ async def tweak_state(adjustment: Adjustment):
 async def get_state():
     state = loadState()
     powerString = "{0}% power".format(state.power) if state.on else "OFF"
-    return "{0} (r:{1}%, g:{2}%, b:{3}%, w:{4}%)".format(powerString, state.colour.red, state.colour.green, state.colour.blue, state.colour.white)
+    colour = state.presets[state.presetIdx]
+    return "{0} (r:{1}%, g:{2}%, b:{3}%, w:{4}%)".format(powerString, colour.red, colour.green, colour.blue, colour.white)
 
 @app.post('/set_state', status_code=200)
 async def set_state(newState: State):
@@ -214,7 +229,7 @@ class Fade(Thread):
     def run(self):
         # Make sure PWM dutycycle is always set at least once
         targetState = loadState()
-        initialColour = targetState.colour
+        initialColour = targetState.presets[targetState.presetIdx]
         maxColourVal = max(initialColour.red, max(initialColour.green, max(initialColour.blue, initialColour.white)))
         effectivePower = getEffectivePower(targetState)
         pi.set_PWM_dutycycle(RED_GPIO, getPwmColour(maxColourVal, effectivePower, initialColour.red))
@@ -236,12 +251,13 @@ class Fade(Thread):
 
                 initialState = targetState.duplicate()
                 targetState = applyTask(task, targetState)
-                maxColourVal = max(targetState.colour.red, max(targetState.colour.green, max(targetState.colour.blue, targetState.colour.white)))
+                targetColour = targetState.presets[targetState.presetIdx]
+                maxColourVal = max(targetColour.red, max(targetColour.green, max(targetColour.blue, targetColour.white)))
                 effectivePower = getEffectivePower(targetState)
-                targetRed = getPwmColour(maxColourVal, effectivePower, targetState.colour.red)
-                targetGreen = getPwmColour(maxColourVal, effectivePower, targetState.colour.green)
-                targetBlue = getPwmColour(maxColourVal, effectivePower, targetState.colour.blue)
-                targetWhite = getPwmColour(maxColourVal, effectivePower, targetState.colour.white)
+                targetRed = getPwmColour(maxColourVal, effectivePower, targetColour.red)
+                targetGreen = getPwmColour(maxColourVal, effectivePower, targetColour.green)
+                targetBlue = getPwmColour(maxColourVal, effectivePower, targetColour.blue)
+                targetWhite = getPwmColour(maxColourVal, effectivePower, targetColour.white)
             except Empty:
                 sleep(0.1)
                 continue
@@ -328,7 +344,7 @@ def button_held():
         knobState = KnobState.DEFAULT
         q.put(StateChange(power=10, flash=True, fadeTime=0.15))
     else:
-        q.put(getStateChange(task = Task(fadeTime=FADE_TIME)))
+        q.put(ChangePreset(fadeTime=0.25))
 
 def button_released():
     global isHeld
