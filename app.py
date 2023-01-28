@@ -54,26 +54,26 @@ class Task(BaseModel):
 class Power(Task):
     value: int
 
-class Adjustment(Task):
-    power: int = 0
+class Colour(BaseModel):
     red: int = 0
     green: int = 0
     blue: int = 0
     white: int = 0
 
+class Adjustment(Task):
+    power: int = 0
+    colour: Colour = Colour()
+
 class Switch(Task):
     pass
 
 class State(BaseModel):
-    red: int = 0
-    green: int = 0
-    blue: int = 0
-    white: int = 100
+    colour: Colour = Colour()
     on: bool = True
     power: int = 100
 
     def duplicate(self):
-        return State(red=self.red, green=self.green, blue=self.blue, white=self.white, on=self.on, power=self.power)
+        return State(colour=self.colour, on=self.on, power=self.power)
 
 class StateChange(State, Task):
     red: Optional[int] = None
@@ -93,17 +93,17 @@ def getPwmColour(maxColourVal: int, effectivePower: int, colourVal: int) -> int:
 def applyTask(task, currentTarget: State) -> State:
     targetState = currentTarget.duplicate()
     if type(task) is Adjustment:
-        if currentTarget.on or (task.red <= 0 and task.green <= 0 and task.blue <= 0 and task.white <= 0):
-            targetState.red = bound(0, 100, currentTarget.red + task.red)
-            targetState.green = bound(0, 100, currentTarget.green + task.green)
-            targetState.blue = bound(0, 100, currentTarget.blue + task.blue)
-            targetState.white = bound(0, 100, currentTarget.white + task.white)
+        if currentTarget.on or (task.colour.red <= 0 and task.colour.green <= 0 and task.colour.blue <= 0 and task.colour.white <= 0):
+            targetState.colour.red = bound(0, 100, currentTarget.colour.red + task.colour.red)
+            targetState.colour.green = bound(0, 100, currentTarget.colour.green + task.colour.green)
+            targetState.colour.blue = bound(0, 100, currentTarget.colour.blue + task.colour.blue)
+            targetState.colour.white = bound(0, 100, currentTarget.colour.white + task.colour.white)
         else:
             # Just set target to the adjustment if we are currently off and have increased a colour
-            targetState.red = task.red
-            targetState.green = task.green
-            targetState.blue = task.blue
-            targetState.white = task.white
+            targetState.colour.red = task.colour.red
+            targetState.colour.green = task.colour.green
+            targetState.colour.blue = task.colour.blue
+            targetState.colour.white = task.colour.white
         targetState.on = True
         if currentTarget.on:
             targetState.power = bound(0, 100, currentTarget.power + task.power)
@@ -118,14 +118,16 @@ def applyTask(task, currentTarget: State) -> State:
         else:
             targetState.on = not targetState.on
 
-    else:
+    elif type(task) is StateChange:
         # StateChange
-        targetState.red = currentTarget.red if task.red is None else bound(0, 100, task.red)
-        targetState.green = currentTarget.green if task.green is None else bound(0, 100, task.green)
-        targetState.blue = currentTarget.blue if task.blue is None else bound(0, 100, task.blue)
-        targetState.white = currentTarget.white if task.white is None else bound(0, 100, task.white)
+        targetState.colour.red = currentTarget.red if task.red is None else bound(0, 100, task.red)
+        targetState.colour.green = currentTarget.green if task.green is None else bound(0, 100, task.green)
+        targetState.colour.blue = currentTarget.blue if task.blue is None else bound(0, 100, task.blue)
+        targetState.colour.white = currentTarget.white if task.white is None else bound(0, 100, task.white)
         targetState.power = currentTarget.power if task.power is None else bound(0, 100, task.power)
         targetState.on = currentTarget.on if task.on is None else task.on
+    else:
+        print("Unknown task type")
     return targetState
 
 def bound(low, high, value):
@@ -137,20 +139,22 @@ def lerp(A, B, C):
 def loadState():
     with open('./state.json', 'r') as f:
         stateJson = json.load(f)
-        state = State(red=stateJson["red"], green=stateJson["green"], blue=stateJson["blue"], white=stateJson["white"], on=stateJson["on"], power=stateJson["power"])
+        state = State(colour=Colour(red=stateJson["colour"]["red"], green=stateJson["colour"]["green"], blue=stateJson["colour"]["blue"], white=stateJson["colour"]["white"]), on=stateJson["on"], power=stateJson["power"])
         f.close()
         return state
 
 def getStateChange(state: State = State(), task: Task = Task()):
-    return StateChange(red=state.red, green=state.green, blue=state.blue, white=state.white, on=state.on, power=state.power, flash=task.flash, fadeTime=task.fadeTime, postDelay=task.postDelay)
+    return StateChange(red=state.colour.red, green=state.colour.green, blue=state.colour.blue, white=state.colour.white, on=state.on, power=state.power, flash=task.flash, fadeTime=task.fadeTime, postDelay=task.postDelay)
 
 def saveState(state: State):
     with open('./state.json', 'w') as f:
         stateDict = {
-            "red": state.red,
-            "green": state.green,
-            "blue": state.blue,
-            "white": state.white,
+            "colour": {
+                "red": state.colour.red,
+                "green": state.colour.green,
+                "blue": state.colour.blue,
+                "white": state.colour.white,
+            },
             "on": state.on,
             "power": state.power,
         }
@@ -169,10 +173,10 @@ async def switch():
 @app.post('/tweak_state', status_code=200)
 async def tweak_state(adjustment: Adjustment):
     global q
-    adjustment.red = bound(-100, 100, adjustment.red)
-    adjustment.green = bound(-100, 100, adjustment.green)
-    adjustment.blue = bound(-100, 100, adjustment.blue)
-    adjustment.white = bound(-100, 100, adjustment.white)
+    adjustment.colour.red = bound(-100, 100, adjustment.colour.red)
+    adjustment.colour.green = bound(-100, 100, adjustment.colour.green)
+    adjustment.colour.blue = bound(-100, 100, adjustment.colour.blue)
+    adjustment.colour.white = bound(-100, 100, adjustment.colour.white)
 
     q.put(adjustment)
 
@@ -180,7 +184,7 @@ async def tweak_state(adjustment: Adjustment):
 async def get_state():
     state = loadState()
     powerString = "{0}% power".format(state.power) if state.on else "OFF"
-    return "{0} (r:{1}%, g:{2}%, b:{3}%, w:{4}%)".format(powerString, state.red, state.green, state.blue, state.white)
+    return "{0} (r:{1}%, g:{2}%, b:{3}%, w:{4}%)".format(powerString, state.colour.red, state.colour.green, state.colour.blue, state.colour.white)
 
 @app.post('/set_state', status_code=200)
 async def set_state(newState: State):
@@ -210,12 +214,13 @@ class Fade(Thread):
     def run(self):
         # Make sure PWM dutycycle is always set at least once
         targetState = loadState()
-        maxColourVal = max(targetState.red, max(targetState.green, max(targetState.blue, targetState.white)))
+        initialColour = targetState.colour
+        maxColourVal = max(initialColour.red, max(initialColour.green, max(initialColour.blue, initialColour.white)))
         effectivePower = getEffectivePower(targetState)
-        pi.set_PWM_dutycycle(RED_GPIO, getPwmColour(maxColourVal, effectivePower, targetState.red))
-        pi.set_PWM_dutycycle(GREEN_GPIO, getPwmColour(maxColourVal, effectivePower, targetState.green))
-        pi.set_PWM_dutycycle(BLUE_GPIO, getPwmColour(maxColourVal, effectivePower, targetState.blue))
-        pi.set_PWM_dutycycle(WHITE_GPIO, getPwmColour(maxColourVal, effectivePower, targetState.white))
+        pi.set_PWM_dutycycle(RED_GPIO, getPwmColour(maxColourVal, effectivePower, initialColour.red))
+        pi.set_PWM_dutycycle(GREEN_GPIO, getPwmColour(maxColourVal, effectivePower, initialColour.green))
+        pi.set_PWM_dutycycle(BLUE_GPIO, getPwmColour(maxColourVal, effectivePower, initialColour.blue))
+        pi.set_PWM_dutycycle(WHITE_GPIO, getPwmColour(maxColourVal, effectivePower, initialColour.white))
 
         while True:
             if(self.stopped()):
@@ -231,12 +236,12 @@ class Fade(Thread):
 
                 initialState = targetState.duplicate()
                 targetState = applyTask(task, targetState)
-                maxColourVal = max(targetState.red, max(targetState.green, max(targetState.blue, targetState.white)))
+                maxColourVal = max(targetState.colour.red, max(targetState.colour.green, max(targetState.colour.blue, targetState.colour.white)))
                 effectivePower = getEffectivePower(targetState)
-                targetRed = getPwmColour(maxColourVal, effectivePower, targetState.red)
-                targetGreen = getPwmColour(maxColourVal, effectivePower, targetState.green)
-                targetBlue = getPwmColour(maxColourVal, effectivePower, targetState.blue)
-                targetWhite = getPwmColour(maxColourVal, effectivePower, targetState.white)
+                targetRed = getPwmColour(maxColourVal, effectivePower, targetState.colour.red)
+                targetGreen = getPwmColour(maxColourVal, effectivePower, targetState.colour.green)
+                targetBlue = getPwmColour(maxColourVal, effectivePower, targetState.colour.blue)
+                targetWhite = getPwmColour(maxColourVal, effectivePower, targetState.colour.white)
             except Empty:
                 sleep(0.1)
                 continue
@@ -359,13 +364,13 @@ def clockwise_rotation():
     else:
         knobTimeout = datetime.utcnow() + timedelta(seconds = KNOB_TIMEOUT_SECONDS)
         if knobState == KnobState.MOD_RED:
-            q.put(Adjustment(red=5))
+            q.put(Adjustment(colour=Colour(red=5)))
         elif knobState == KnobState.MOD_GREEN:
-            q.put(Adjustment(green=5))
+            q.put(Adjustment(colour=Colour(green=5)))
         elif knobState == KnobState.MOD_BLUE:
-            q.put(Adjustment(blue=5))
+            q.put(Adjustment(colour=Colour(blue=5)))
         elif knobState == KnobState.MOD_WHITE:
-            q.put(Adjustment(white=5))
+            q.put(Adjustment(colour=Colour(white=5)))
 
 def counter_clockwise_rotation():
     global q
@@ -377,13 +382,13 @@ def counter_clockwise_rotation():
     else:
         knobTimeout = datetime.utcnow() + timedelta(seconds = KNOB_TIMEOUT_SECONDS)
         if knobState == KnobState.MOD_RED:
-            q.put(Adjustment(red=-5))
+            q.put(Adjustment(colour=Colour(red=-5)))
         elif knobState == KnobState.MOD_GREEN:
-            q.put(Adjustment(green=-5))
+            q.put(Adjustment(colour=Colour(green=-5)))
         elif knobState == KnobState.MOD_BLUE:
-            q.put(Adjustment(blue=-5))
+            q.put(Adjustment(colour=Colour(blue=-5)))
         elif knobState == KnobState.MOD_WHITE:
-            q.put(Adjustment(white=-5))
+            q.put(Adjustment(colour=Colour(white=-5)))
 
 q = Queue()
 fadeThread = Fade()
