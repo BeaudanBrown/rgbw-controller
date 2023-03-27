@@ -10,6 +10,7 @@ from pydantic import BaseModel
 import pigpio
 import math
 import json
+import random
 
 from threading import Event, Timer, Thread
 from gpiozero import RotaryEncoder, Button
@@ -48,6 +49,28 @@ knobState = KnobState.DEFAULT
 isHeld = False
 singlePress = False
 
+class Colour(BaseModel):
+    red: float = 0
+    green: float = 0
+    blue: float = 0
+    white: float = 0
+
+class AuroraSettings(BaseModel):
+    storedColour: Colour = Colour()
+    minColour: Colour = Colour()
+    maxColour: Colour = Colour()
+    minColourDist: float = 30
+
+class State(BaseModel):
+    on: bool = True
+    power: int = 100
+    presets: list[Colour] = [Colour(white=100)]
+    presetIdx: int = 0
+    aurora: Optional[AuroraSettings] = None
+
+    def duplicate(self):
+        return State(presets=self.presets, presetIdx=self.presetIdx, on=self.on, power=self.power)
+
 class Task(BaseModel):
     fadeTime: float = 0
     postDelay: float = 0
@@ -55,12 +78,6 @@ class Task(BaseModel):
 
 class Power(Task):
     value: int
-
-class Colour(BaseModel):
-    red: int = 0
-    green: int = 0
-    blue: int = 0
-    white: int = 0
 
 class Adjustment(Task):
     power: int = 0
@@ -72,32 +89,43 @@ class ChangePreset(Task):
 class Switch(Task):
     pass
 
-class State(BaseModel):
-    on: bool = True
-    power: int = 100
-    presets: list[Colour] = [Colour(white=100)]
-    presetIdx: int = 0
-
-    def duplicate(self):
-        return State(presets=self.presets, presetIdx=self.presetIdx, on=self.on, power=self.power)
-
 class StateChange(State, Task):
-    red: Optional[int] = None
-    green: Optional[int] = None
-    blue: Optional[int] = None
-    white: Optional[int] = None
+    red: Optional[float] = None
+    green: Optional[float] = None
+    blue: Optional[float] = None
+    white: Optional[float] = None
     on: Optional[bool] = None
     power: Optional[int] = None
+
+class Aurora(Task):
+    minColour: Colour = Colour()
+    maxColour: Colour = Colour()
+    minColourDist: float = 30
 
 def getEffectivePower(state: State) -> int:
     return state.power if state.on else 0
 
-def getPwmColour(maxColourVal: int, effectivePower: int, colourVal: int) -> int:
+def getPwmColour(maxColourVal: float, effectivePower: int, colourVal: float) -> int:
     effectiveColour = 0 if maxColourVal == 0 else colourVal / maxColourVal * 100
     return bound(0, 255, (effectiveColour * effectivePower * 255) / 10000)
 
+def normalizeColour(colour: Colour):
+    vector = [colour.red, colour.green, colour.blue, colour.white]
+    magnitude = math.sqrt(sum([component**2 for component in vector]))
+    normalizedVec = [component/magnitude for component in vector]
+    return Colour(red=normalizedVec[0], green=normalizedVec[1], blue=normalizedVec[2], white=normalizedVec[3], )
+
+def colourDist(c1: Colour, c2: Colour):
+    return math.sqrt((c1.red-c2.red) ** 2 + (c1.green-c2.green) ** 2 + (c1.blue-c2.blue) ** 2 + (c1.white-c2.white) ** 2)
+
 def applyTask(task, currentTarget: State) -> State:
     targetState = currentTarget.duplicate()
+
+    # If we are exiting the Aurora mode then make sure to return the preset to its original value
+    if type(task) is not Aurora and targetState.aurora is not None:
+        targetState.presets[targetState.presetIdx] = targetState.aurora.storedColour
+        targetState.aurora = None
+
     if type(task) is Adjustment:
         newColour = targetState.presets[targetState.presetIdx]
         if currentTarget.on or (task.colour.red <= 0 and task.colour.green <= 0 and task.colour.blue <= 0 and task.colour.white <= 0):
@@ -139,6 +167,31 @@ def applyTask(task, currentTarget: State) -> State:
         targetState.on = currentTarget.on if task.on is None else task.on
     elif type(task) is ChangePreset:
         targetState.presetIdx = (targetState.presetIdx + 1) % 3
+    elif type(task) is Aurora:
+        # If a new aurora is pushed to the queue, make sure to keep the storedColour from the first one
+        targetState.aurora = AuroraSettings()
+        if currentTarget.aurora is None:
+            targetState.aurora.storedColour = currentTarget.presets[currentTarget.presetIdx]
+        else:
+            targetState.aurora.storedColour = currentTarget.aurora.storedColour
+        targetState.aurora.minColour = task.minColour
+        targetState.aurora.maxColour = task.maxColour
+
+        validVec: bool = False
+        newColour = Colour()
+
+        while not validVec:
+            newColour = Colour(
+                red = random.randint(int(task.minColour.red), int(task.maxColour.red)),
+                green = random.randint(int(task.minColour.green), int(task.maxColour.green)),
+                blue = random.randint(int(task.minColour.blue), int(task.maxColour.blue)),
+                white = random.randint(int(task.minColour.white), int(task.maxColour.white))
+            )
+            normalizedCol = normalizeColour(newColour)
+            validVec = colourDist(normalizedCol, Colour(red=1,green=1,blue=1,white=1)) >= task.minColourDist
+            validVec = colourDist(normalizedCol, currentTarget.presets[currentTarget.presetIdx]) >= task.minColourDist
+
+        targetState.presets[targetState.presetIdx] = newColour
     else:
         print("Unknown task type")
     return targetState
@@ -210,6 +263,11 @@ async def set_state(newState: State):
     q.put(getStateChange(state))
     return newState
 
+@app.post('/aurora', status_code=200)
+async def aurora(aurora: Aurora):
+    global q
+    q.put(aurora)
+
 @app.on_event("shutdown")
 def shutdown():
     global fadeThread
@@ -242,6 +300,10 @@ class Fade(Thread):
         while True:
             if(self.stopped()):
                 print("Stopping")
+                # If we are stopping the loop, make sure to disable the aurora effect properly
+                if targetState.aurora is not None:
+                    targetState.presets[targetState.presetIdx] = targetState.aurora.storedColour
+                    targetState.aurora = None
                 return
             try:
                 task = q.get_nowait()
@@ -289,10 +351,14 @@ class Fade(Thread):
 
             if dt.total_seconds() > task.fadeTime:
                 # task.fadeTime has elapsed, ensure target is reached
+                # This check is required because the loop can break early
                 pi.set_PWM_dutycycle(RED_GPIO, targetRed)
                 pi.set_PWM_dutycycle(GREEN_GPIO, targetGreen)
                 pi.set_PWM_dutycycle(BLUE_GPIO, targetBlue)
                 pi.set_PWM_dutycycle(WHITE_GPIO, targetWhite)
+                if targetState.aurora is not None:
+                    # Aurora mode is enabled, do another aurora cycle
+                    q.put(task)
 
             if task.flash:
                 sleep(task.postDelay)
