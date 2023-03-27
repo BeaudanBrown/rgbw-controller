@@ -36,6 +36,8 @@ class KnobState(Enum):
     MOD_BLUE = 4
     MOD_WHITE = 5
 
+COL_MOD_FADE_TIME = 0.15
+COL_MOD_DELAY_TIME = 0.15
 FADE_TIME = 0.75
 KNOB_TIMEOUT_SECONDS = 10
 INTERVALS = 300
@@ -306,7 +308,7 @@ def check_knob_timeout():
     if knobTimeout <= now:
         if knobState != KnobState.DEFAULT:
             knobState = KnobState.DEFAULT
-            q.put(StateChange(power=10, flash=True, fadeTime=0.15))
+            q.put(StateChange(power=10, flash=True, fadeTime=COL_MOD_FADE_TIME))
     else:
         Timer((knobTimeout - now).total_seconds(), check_knob_timeout).start()
 
@@ -322,16 +324,16 @@ def check_double_click():
             q.put(Switch(fadeTime=FADE_TIME))
         else:
             if knobState == KnobState.MOD_RED:
-                q.put(StateChange(red=0, green=100, blue=0, white=0, flash=True, postDelay=0.5, fadeTime=0.25))
+                q.put(StateChange(red=0, green=100, blue=0, white=0, flash=True, postDelay=COL_MOD_DELAY_TIME, fadeTime=COL_MOD_FADE_TIME))
                 knobState = KnobState.MOD_GREEN
             elif knobState == KnobState.MOD_GREEN:
-                q.put(StateChange(red=0, green=0, blue=100, white=0, flash=True, postDelay=0.5, fadeTime=0.25))
+                q.put(StateChange(red=0, green=0, blue=100, white=0, flash=True, postDelay=COL_MOD_DELAY_TIME, fadeTime=COL_MOD_FADE_TIME))
                 knobState = KnobState.MOD_BLUE
             elif knobState == KnobState.MOD_BLUE:
-                q.put(StateChange(red=0, green=0, blue=0, white=100, flash=True, postDelay=0.5, fadeTime=0.25))
+                q.put(StateChange(red=0, green=0, blue=0, white=100, flash=True, postDelay=COL_MOD_DELAY_TIME, fadeTime=COL_MOD_FADE_TIME))
                 knobState = KnobState.MOD_WHITE
             else:
-                q.put(StateChange(red=100, green=0, blue=0, white=0, flash=True, postDelay=0.5, fadeTime=0.25))
+                q.put(StateChange(red=100, green=0, blue=0, white=0, flash=True, postDelay=COL_MOD_DELAY_TIME, fadeTime=COL_MOD_FADE_TIME))
                 knobState = KnobState.MOD_RED
             knobTimeout = datetime.utcnow() + timedelta(seconds = KNOB_TIMEOUT_SECONDS)
 
@@ -342,7 +344,7 @@ def button_held():
     isHeld = True
     if knobState != KnobState.DEFAULT:
         knobState = KnobState.DEFAULT
-        q.put(StateChange(power=10, flash=True, fadeTime=0.15))
+        q.put(StateChange(power=10, flash=True, fadeTime=COL_MOD_FADE_TIME))
     else:
         q.put(ChangePreset(fadeTime=0.25))
 
@@ -358,12 +360,12 @@ def button_released():
             singlePress = False
             if knobState == KnobState.DEFAULT:
                 knobState = KnobState.MOD_RED
-                q.put(StateChange(red=100, green=0, blue=0, white=0, flash=True, postDelay=0.5, fadeTime=0.25))
+                q.put(StateChange(red=100, green=0, blue=0, white=0, flash=True, postDelay=COL_MOD_DELAY_TIME, fadeTime=COL_MOD_FADE_TIME))
                 knobTimeout = datetime.utcnow() + timedelta(seconds = KNOB_TIMEOUT_SECONDS)
                 Timer(KNOB_TIMEOUT_SECONDS, check_knob_timeout).start()
             else:
                 knobState = KnobState.DEFAULT
-                q.put(StateChange(power=10, flash=True, fadeTime=0.15))
+                q.put(StateChange(power=10, flash=True, fadeTime=COL_MOD_FADE_TIME))
         else:
             # Single click has occurred
             singlePress = True
