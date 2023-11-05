@@ -59,7 +59,7 @@ class AuroraSettings(BaseModel):
     storedColour: Colour = Colour()
     minColour: Colour = Colour()
     maxColour: Colour = Colour()
-    minColourDist: float = 30
+    minColourDist: float = 0.4
 
 class State(BaseModel):
     on: bool = True
@@ -100,7 +100,7 @@ class StateChange(State, Task):
 class Aurora(Task):
     minColour: Colour = Colour()
     maxColour: Colour = Colour()
-    minColourDist: float = 30
+    minColourDist: float = 0.4
 
 def getEffectivePower(state: State) -> int:
     return state.power if state.on else 0
@@ -112,8 +112,12 @@ def getPwmColour(maxColourVal: float, effectivePower: int, colourVal: float) -> 
 def normalizeColour(colour: Colour):
     vector = [colour.red, colour.green, colour.blue, colour.white]
     magnitude = math.sqrt(sum([component**2 for component in vector]))
+    if magnitude == 0:
+        return colour
     normalizedVec = [component/magnitude for component in vector]
     return Colour(red=normalizedVec[0], green=normalizedVec[1], blue=normalizedVec[2], white=normalizedVec[3], )
+
+unitWhite = normalizeColour(Colour(red=1, green=1, blue=1, white=0))
 
 def colourDist(c1: Colour, c2: Colour):
     return math.sqrt((c1.red-c2.red) ** 2 + (c1.green-c2.green) ** 2 + (c1.blue-c2.blue) ** 2 + (c1.white-c2.white) ** 2)
@@ -148,8 +152,8 @@ def applyTask(task, currentTarget: State) -> State:
 
     elif type(task) is Switch:
         if targetState.power == 0:
-            # Turn on at 10 power if power is currently 0 to avoid switch with no effect
-            targetState.power = 10
+            # Default to full power when pressing the switch after dimming to zero
+            targetState.power = 100
             targetState.on = True
         else:
             targetState.on = not targetState.on
@@ -187,9 +191,14 @@ def applyTask(task, currentTarget: State) -> State:
                 blue = random.randint(int(task.minColour.blue), int(task.maxColour.blue)),
                 white = random.randint(int(task.minColour.white), int(task.maxColour.white))
             )
+
             normalizedCol = normalizeColour(newColour)
-            validVec = colourDist(normalizedCol, Colour(red=1,green=1,blue=1,white=1)) >= task.minColourDist
-            validVec = colourDist(normalizedCol, currentTarget.presets[currentTarget.presetIdx]) >= task.minColourDist
+            normColMinusWhite = normalizeColour(Colour(red=newColour.red, green=newColour.green, blue=newColour.blue))
+            distToWhite = colourDist(normColMinusWhite, unitWhite)
+            distToOldTarget = colourDist(normalizedCol, normalizeColour(currentTarget.presets[currentTarget.presetIdx]))
+            isOff = newColour.red == 0 and newColour.green == 0 and newColour.blue == 0 and newColour.white == 0
+
+            validVec = distToWhite >= task.minColourDist and distToOldTarget >= task.minColourDist and not isOff
 
         targetState.presets[targetState.presetIdx] = newColour
     else:
@@ -323,13 +332,15 @@ class Fade(Thread):
                 targetBlue = getPwmColour(maxColourVal, effectivePower, targetColour.blue)
                 targetWhite = getPwmColour(maxColourVal, effectivePower, targetColour.white)
             except Empty:
-                sleep(0.1)
+                sleep(0.05)
                 continue
 
             startTime = datetime.utcnow()
             dt = datetime.utcnow() - startTime
+            brokeEarly = False
             while dt.total_seconds() <= task.fadeTime:
-                if(self.stopped() or not q.empty()):
+                brokeEarly = self.stopped() or not q.empty()
+                if(brokeEarly):
                     print("Broke early")
                     break
 
@@ -349,19 +360,24 @@ class Fade(Thread):
                 pi.set_PWM_dutycycle(BLUE_GPIO, lerp(startBlue, targetBlue, blueC))
                 pi.set_PWM_dutycycle(WHITE_GPIO, lerp(startWhite, targetWhite, whiteC))
 
-            if dt.total_seconds() > task.fadeTime:
-                # task.fadeTime has elapsed, ensure target is reached
-                # This check is required because the loop can break early
-                pi.set_PWM_dutycycle(RED_GPIO, targetRed)
-                pi.set_PWM_dutycycle(GREEN_GPIO, targetGreen)
-                pi.set_PWM_dutycycle(BLUE_GPIO, targetBlue)
-                pi.set_PWM_dutycycle(WHITE_GPIO, targetWhite)
-                if targetState.aurora is not None:
-                    # Aurora mode is enabled, do another aurora cycle
-                    q.put(task)
+            if brokeEarly:
+                continue
+
+            # task.fadeTime has elapsed, ensure target is reached
+            pi.set_PWM_dutycycle(RED_GPIO, targetRed)
+            pi.set_PWM_dutycycle(GREEN_GPIO, targetGreen)
+            pi.set_PWM_dutycycle(BLUE_GPIO, targetBlue)
+            pi.set_PWM_dutycycle(WHITE_GPIO, targetWhite)
+            sleep(task.postDelay)
+
+            if targetState.aurora is not None and q.empty():
+                # Aurora mode is enabled, do another aurora cycle
+                if not q.empty():
+                    print("This is a strange situation")
+                q.put(task)
+                continue
 
             if task.flash:
-                sleep(task.postDelay)
                 q.put(getStateChange(initialState, Task(fadeTime = task.fadeTime)))
             else:
                 saveState(targetState)
