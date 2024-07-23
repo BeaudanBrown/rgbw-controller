@@ -1,6 +1,6 @@
 from time import sleep
 from queue import Queue, Empty
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from enum import Enum
 from typing import Optional
 
@@ -19,6 +19,7 @@ app = FastAPI()
 
 pi = pigpio.pi()
 
+MINIMUM_DIM_POWER = 2
 HOLD_TIME = 0.5
 DOUBLE_CLICK_TIME = 0.4
 RED_GPIO = 26
@@ -147,7 +148,17 @@ def applyTask(task, currentTarget: State) -> State:
         targetState.on = True
         if currentTarget.on:
             targetState.power = bound(0, 100, currentTarget.power + task.power)
+            # Have a final minimum power level before going to zero or up from zero
+            if currentTarget.power > MINIMUM_DIM_POWER and targetState.power == 0:
+                # Started above the minimum dim and went to zero
+                targetState.power = MINIMUM_DIM_POWER
+            elif currentTarget.power == 0 and targetState.power > 0:
+                # Started at zero and went up
+                targetState.power = MINIMUM_DIM_POWER
         elif task.power > 0:
+            # Light was off and went up
+            targetState.power = MINIMUM_DIM_POWER
+        else:
             targetState.power = bound(0, 100, task.power)
 
     elif type(task) is Switch:
@@ -308,13 +319,15 @@ class Fade(Thread):
 
         while True:
             if(self.stopped()):
-                print("Stopping")
+                print("Stopping fade thread")
                 # If we are stopping the loop, make sure to disable the aurora effect properly
                 if targetState.aurora is not None:
                     targetState.presets[targetState.presetIdx] = targetState.aurora.storedColour
                     targetState.aurora = None
                 return
             try:
+                if q.qsize() > 1:
+                    print("This queue has multiple things in it")
                 task = q.get_nowait()
 
                 startRed = pi.get_PWM_dutycycle(RED_GPIO)
