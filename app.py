@@ -1,8 +1,8 @@
-from time import sleep
+import time
 from queue import Queue, Empty
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta
 from enum import Enum
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -38,6 +38,7 @@ class KnobState(Enum):
     MOD_BLUE = 4
     MOD_WHITE = 5
 
+NUM_PRESETS = 3
 COL_MOD_FADE_TIME = 0.15
 COL_MOD_DELAY_TIME = 0.15
 FADE_TIME = 0.75
@@ -65,12 +66,18 @@ class AuroraSettings(BaseModel):
 class State(BaseModel):
     on: bool = True
     power: int = 100
-    presets: list[Colour] = [Colour(white=100)]
+    presets: List[Colour] = [Colour(white=100)] * NUM_PRESETS
     presetIdx: int = 0
     aurora: Optional[AuroraSettings] = None
 
-    def duplicate(self):
-        return State(presets=self.presets, presetIdx=self.presetIdx, on=self.on, power=self.power)
+    def duplicate(self) -> 'State':
+        return State(
+            presets=self.presets.copy(),
+            presetIdx=self.presetIdx,
+            on=self.on,
+            power=self.power,
+            aurora=self.aurora
+        )
 
 class Task(BaseModel):
     fadeTime: float = 0
@@ -110,40 +117,47 @@ def getPwmColour(maxColourVal: float, effectivePower: int, colourVal: float) -> 
     effectiveColour = 0 if maxColourVal == 0 else colourVal / maxColourVal * 100
     return bound(0, 255, (effectiveColour * effectivePower * 255) / 10000)
 
-def normalizeColour(colour: Colour):
+def normalizeColour(colour: Colour) -> Colour:
     vector = [colour.red, colour.green, colour.blue, colour.white]
-    magnitude = math.sqrt(sum([component**2 for component in vector]))
+    magnitude = math.sqrt(sum(component**2 for component in vector))
     if magnitude == 0:
         return colour
-    normalizedVec = [component/magnitude for component in vector]
-    return Colour(red=normalizedVec[0], green=normalizedVec[1], blue=normalizedVec[2], white=normalizedVec[3], )
+    normalizedVec = [component / magnitude for component in vector]
+    return Colour(
+        red=normalizedVec[0],
+        green=normalizedVec[1],
+        blue=normalizedVec[2],
+        white=normalizedVec[3],
+    )
 
 unitWhite = normalizeColour(Colour(red=1, green=1, blue=1, white=0))
 
-def colourDist(c1: Colour, c2: Colour):
-    return math.sqrt((c1.red-c2.red) ** 2 + (c1.green-c2.green) ** 2 + (c1.blue-c2.blue) ** 2 + (c1.white-c2.white) ** 2)
+def colourDist(c1: Colour, c2: Colour) -> float:
+    return math.sqrt(
+        (c1.red - c2.red) ** 2 +
+        (c1.green - c2.green) ** 2 +
+        (c1.blue - c2.blue) ** 2 +
+        (c1.white - c2.white) ** 2
+    )
 
-def applyTask(task, currentTarget: State) -> State:
+def applyTask(task: Task, currentTarget: State) -> State:
     targetState = currentTarget.duplicate()
 
     # If we are exiting the Aurora mode then make sure to return the preset to its original value
-    if type(task) is not Aurora and targetState.aurora is not None:
+    if not isinstance(task, Aurora) and targetState.aurora is not None:
         targetState.presets[targetState.presetIdx] = targetState.aurora.storedColour
         targetState.aurora = None
 
-    if type(task) is Adjustment:
+    if isinstance(task, Adjustment):
         newColour = targetState.presets[targetState.presetIdx]
-        if currentTarget.on or (task.colour.red <= 0 and task.colour.green <= 0 and task.colour.blue <= 0 and task.colour.white <= 0):
+        if currentTarget.on or all(value <= 0 for value in vars(task.colour).values()):
             newColour.red = bound(0, 100, newColour.red + task.colour.red)
             newColour.green = bound(0, 100, newColour.green + task.colour.green)
             newColour.blue = bound(0, 100, newColour.blue + task.colour.blue)
             newColour.white = bound(0, 100, newColour.white + task.colour.white)
         else:
-            # Just set target to the adjustment if we are currently off and have increased a colour
-            newColour.red = task.colour.red
-            newColour.green = task.colour.green
-            newColour.blue = task.colour.blue
-            newColour.white = task.colour.white
+            # Set target to the adjustment if we are currently off and have increased a colour
+            newColour = task.colour
         targetState.presets[targetState.presetIdx] = newColour
         targetState.on = True
         if currentTarget.on:
@@ -161,7 +175,7 @@ def applyTask(task, currentTarget: State) -> State:
         else:
             targetState.power = bound(0, 100, task.power)
 
-    elif type(task) is Switch:
+    elif isinstance(task, Switch):
         if targetState.power == 0:
             # Default to full power when pressing the switch after dimming to zero
             targetState.power = 100
@@ -169,45 +183,47 @@ def applyTask(task, currentTarget: State) -> State:
         else:
             targetState.on = not targetState.on
 
-    elif type(task) is StateChange:
+    elif isinstance(task, StateChange):
         # StateChange
         newColour = Colour(
-            red = currentTarget.presets[currentTarget.presetIdx].red if task.red is None else bound(0, 100, task.red),
-            green = currentTarget.presets[currentTarget.presetIdx].green if task.green is None else bound(0, 100, task.green),
-            blue = currentTarget.presets[currentTarget.presetIdx].blue if task.blue is None else bound(0, 100, task.blue),
-            white = currentTarget.presets[currentTarget.presetIdx].white if task.white is None else bound(0, 100, task.white),
+            red=currentTarget.presets[currentTarget.presetIdx].red if task.red is None else bound(0, 100, task.red),
+            green=currentTarget.presets[currentTarget.presetIdx].green if task.green is None else bound(0, 100, task.green),
+            blue=currentTarget.presets[currentTarget.presetIdx].blue if task.blue is None else bound(0, 100, task.blue),
+            white=currentTarget.presets[currentTarget.presetIdx].white if task.white is None else bound(0, 100, task.white),
         )
         targetState.presets[targetState.presetIdx] = newColour
         targetState.power = currentTarget.power if task.power is None else bound(0, 100, task.power)
         targetState.on = currentTarget.on if task.on is None else task.on
-    elif type(task) is ChangePreset:
-        targetState.presetIdx = (targetState.presetIdx + 1) % 3
-    elif type(task) is Aurora:
+    elif isinstance(task, ChangePreset):
+        targetState.presetIdx = (targetState.presetIdx + 1) % NUM_PRESETS
+    elif isinstance(task, Aurora):
         # If a new aurora is pushed to the queue, make sure to keep the storedColour from the first one
-        targetState.aurora = AuroraSettings()
         if currentTarget.aurora is None:
-            targetState.aurora.storedColour = currentTarget.presets[currentTarget.presetIdx]
+            storedColour = currentTarget.presets[currentTarget.presetIdx]
         else:
-            targetState.aurora.storedColour = currentTarget.aurora.storedColour
-        targetState.aurora.minColour = task.minColour
-        targetState.aurora.maxColour = task.maxColour
+            storedColour = currentTarget.aurora.storedColour
+        targetState.aurora = AuroraSettings(
+            storedColour=storedColour,
+            minColour = task.minColour,
+            maxColour = task.maxColour
+        )
 
-        validVec: bool = False
+        validVec = False
         newColour = Colour()
 
         while not validVec:
             newColour = Colour(
-                red = random.randint(int(task.minColour.red), int(task.maxColour.red)),
-                green = random.randint(int(task.minColour.green), int(task.maxColour.green)),
-                blue = random.randint(int(task.minColour.blue), int(task.maxColour.blue)),
-                white = random.randint(int(task.minColour.white), int(task.maxColour.white))
+                red=random.randint(int(task.minColour.red), int(task.maxColour.red)),
+                green=random.randint(int(task.minColour.green), int(task.maxColour.green)),
+                blue=random.randint(int(task.minColour.blue), int(task.maxColour.blue)),
+                white=random.randint(int(task.minColour.white), int(task.maxColour.white))
             )
 
             normalizedCol = normalizeColour(newColour)
             normColMinusWhite = normalizeColour(Colour(red=newColour.red, green=newColour.green, blue=newColour.blue))
             distToWhite = colourDist(normColMinusWhite, unitWhite)
             distToOldTarget = colourDist(normalizedCol, normalizeColour(currentTarget.presets[currentTarget.presetIdx]))
-            isOff = newColour.red == 0 and newColour.green == 0 and newColour.blue == 0 and newColour.white == 0
+            isOff = all(value == 0 for value in vars(newColour).values())
 
             validVec = distToWhite >= task.minColourDist and distToOldTarget >= task.minColourDist and not isOff
 
@@ -216,35 +232,47 @@ def applyTask(task, currentTarget: State) -> State:
         print("Unknown task type")
     return targetState
 
-def bound(low, high, value):
+def bound(low: int, high: int, value: float) -> int:
     return int(max(low, min(high, value)))
 
-def lerp(A, B, C):
+def lerp(A: float, B: float, C: float) -> float:
     return A + C * (B - A)
 
-def loadState():
+def loadState() -> State:
     with open('./state.json', 'r') as f:
         stateJson = json.load(f)
-        presets = list(map(lambda preset : Colour(red=preset["red"], green=preset["green"], blue=preset["blue"], white=preset["white"]), stateJson["presets"]))
-        state = State(presets=presets, presetIdx=stateJson["presetIdx"], on=stateJson["on"], power=stateJson["power"])
-        f.close()
+        presets = [Colour(**preset) for preset in stateJson["presets"]]
+        state = State(
+            presets=presets,
+            presetIdx=stateJson["presetIdx"],
+            on=stateJson["on"],
+            power=stateJson["power"]
+        )
         return state
 
-def getStateChange(state: State = State(), task: Task = Task()):
+def getStateChange(state: State = State(), task: Task = Task()) -> StateChange:
     activeColour = state.presets[state.presetIdx]
-    return StateChange(red=activeColour.red, green=activeColour.green, blue=activeColour.blue, white=activeColour.white, on=state.on, power=state.power, flash=task.flash, fadeTime=task.fadeTime, postDelay=task.postDelay)
+    return StateChange(
+        red=activeColour.red,
+        green=activeColour.green,
+        blue=activeColour.blue,
+        white=activeColour.white,
+        on=state.on,
+        power=state.power,
+        flash=task.flash,
+        fadeTime=task.fadeTime,
+        postDelay=task.postDelay
+    )
 
 def saveState(state: State):
     with open('./state.json', 'w') as f:
         stateDict = {
             "on": state.on,
             "power": state.power,
-            "presets": list(map(lambda colour : { "red": colour.red, "green": colour.green, "blue": colour.blue, "white": colour.white, }, state.presets)),
+            "presets": [colour.dict() for colour in state.presets],
             "presetIdx": state.presetIdx,
         }
         json.dump(stateDict, f)
-        f.close()
-        return
 
 @app.post('/change_preset', status_code=200)
 async def change_preset():
@@ -254,7 +282,10 @@ async def change_preset():
 @app.post('/switch', status_code=200)
 async def switch():
     global q
-    isOn = (pi.get_PWM_dutycycle(RED_GPIO) + pi.get_PWM_dutycycle(GREEN_GPIO) + pi.get_PWM_dutycycle(BLUE_GPIO) + pi.get_PWM_dutycycle(WHITE_GPIO)) > 0
+    isOn = (pi.get_PWM_dutycycle(RED_GPIO) +
+            pi.get_PWM_dutycycle(GREEN_GPIO) +
+            pi.get_PWM_dutycycle(BLUE_GPIO) +
+            pi.get_PWM_dutycycle(WHITE_GPIO)) > 0
     q.put(Switch(fadeTime=FADE_TIME))
     # FIXME: This can be incorrect if switched on and off quickly
     return "ON" if not isOn else "OFF"
@@ -303,14 +334,14 @@ class Fade(Thread):
         print("Received stop")
         self._stop_event.set()
 
-    def stopped(self):
+    def stopped(self) -> bool:
         return self._stop_event.is_set()
 
     def run(self):
         # Make sure PWM dutycycle is always set at least once
         targetState = loadState()
         initialColour = targetState.presets[targetState.presetIdx]
-        maxColourVal = max(initialColour.red, max(initialColour.green, max(initialColour.blue, initialColour.white)))
+        maxColourVal = max(initialColour.red, initialColour.green, initialColour.blue, initialColour.white)
         effectivePower = getEffectivePower(targetState)
         pi.set_PWM_dutycycle(RED_GPIO, getPwmColour(maxColourVal, effectivePower, initialColour.red))
         pi.set_PWM_dutycycle(GREEN_GPIO, getPwmColour(maxColourVal, effectivePower, initialColour.green))
@@ -318,7 +349,7 @@ class Fade(Thread):
         pi.set_PWM_dutycycle(WHITE_GPIO, getPwmColour(maxColourVal, effectivePower, initialColour.white))
 
         while True:
-            if(self.stopped()):
+            if self.stopped():
                 print("Stopping fade thread")
                 # If we are stopping the loop, make sure to disable the aurora effect properly
                 if targetState.aurora is not None:
@@ -338,27 +369,27 @@ class Fade(Thread):
                 initialState = targetState.duplicate()
                 targetState = applyTask(task, targetState)
                 targetColour = targetState.presets[targetState.presetIdx]
-                maxColourVal = max(targetColour.red, max(targetColour.green, max(targetColour.blue, targetColour.white)))
+                maxColourVal = max(targetColour.red, targetColour.green, targetColour.blue, targetColour.white)
                 effectivePower = getEffectivePower(targetState)
                 targetRed = getPwmColour(maxColourVal, effectivePower, targetColour.red)
                 targetGreen = getPwmColour(maxColourVal, effectivePower, targetColour.green)
                 targetBlue = getPwmColour(maxColourVal, effectivePower, targetColour.blue)
                 targetWhite = getPwmColour(maxColourVal, effectivePower, targetColour.white)
             except Empty:
-                sleep(0.05)
+                time.sleep(0.05)
                 continue
 
-            startTime = datetime.utcnow()
-            dt = datetime.utcnow() - startTime
+            startTime = time.monotonic()
+            dt = 0
             brokeEarly = False
-            while dt.total_seconds() <= task.fadeTime:
-                brokeEarly = self.stopped() or not q.empty()
-                if(brokeEarly):
+            while dt <= task.fadeTime:
+                if self.stopped() or not q.empty():
                     print("Broke early")
+                    brokeEarly = True
                     break
 
-                dt = datetime.utcnow() - startTime
-                currentInterval = INTERVALS if task.fadeTime == 0 else math.floor(min(1.0, dt.total_seconds() / task.fadeTime) * INTERVALS)
+                dt = time.monotonic() - startTime
+                currentInterval = INTERVALS if task.fadeTime == 0 else math.floor(min(1.0, dt / task.fadeTime) * INTERVALS)
 
                 increasingC = (2.0 ** (currentInterval / R) - 1) / 255.0
                 decreasingC = 1.0 - ((2.0 ** ((INTERVALS - currentInterval) / R) - 1) / 255.0)
@@ -373,6 +404,8 @@ class Fade(Thread):
                 pi.set_PWM_dutycycle(BLUE_GPIO, lerp(startBlue, targetBlue, blueC))
                 pi.set_PWM_dutycycle(WHITE_GPIO, lerp(startWhite, targetWhite, whiteC))
 
+                time.sleep(0.01)  # Adjust sleep time as needed
+
             if brokeEarly:
                 continue
 
@@ -381,7 +414,7 @@ class Fade(Thread):
             pi.set_PWM_dutycycle(GREEN_GPIO, targetGreen)
             pi.set_PWM_dutycycle(BLUE_GPIO, targetBlue)
             pi.set_PWM_dutycycle(WHITE_GPIO, targetWhite)
-            sleep(task.postDelay)
+            time.sleep(task.postDelay)
 
             if targetState.aurora is not None and q.empty():
                 # Aurora mode is enabled, do another aurora cycle
@@ -391,7 +424,7 @@ class Fade(Thread):
                 continue
 
             if task.flash:
-                q.put(getStateChange(initialState, Task(fadeTime = task.fadeTime)))
+                q.put(getStateChange(initialState, Task(fadeTime=task.fadeTime)))
             else:
                 saveState(targetState)
 
@@ -430,7 +463,7 @@ def check_double_click():
             else:
                 q.put(StateChange(red=100, green=0, blue=0, white=0, flash=True, postDelay=COL_MOD_DELAY_TIME, fadeTime=COL_MOD_FADE_TIME))
                 knobState = KnobState.MOD_RED
-            knobTimeout = datetime.utcnow() + timedelta(seconds = KNOB_TIMEOUT_SECONDS)
+            knobTimeout = datetime.utcnow() + timedelta(seconds=KNOB_TIMEOUT_SECONDS)
 
 def button_held():
     global isHeld
@@ -456,7 +489,7 @@ def button_released():
             if knobState == KnobState.DEFAULT:
                 knobState = KnobState.MOD_RED
                 q.put(StateChange(red=100, green=0, blue=0, white=0, flash=True, postDelay=COL_MOD_DELAY_TIME, fadeTime=COL_MOD_FADE_TIME))
-                knobTimeout = datetime.utcnow() + timedelta(seconds = KNOB_TIMEOUT_SECONDS)
+                knobTimeout = datetime.utcnow() + timedelta(seconds=KNOB_TIMEOUT_SECONDS)
                 Timer(KNOB_TIMEOUT_SECONDS, check_knob_timeout).start()
             else:
                 knobState = KnobState.DEFAULT
@@ -475,7 +508,7 @@ def clockwise_rotation():
     if knobState == KnobState.DEFAULT:
         q.put(Adjustment(power=10))
     else:
-        knobTimeout = datetime.utcnow() + timedelta(seconds = KNOB_TIMEOUT_SECONDS)
+        knobTimeout = datetime.utcnow() + timedelta(seconds=KNOB_TIMEOUT_SECONDS)
         if knobState == KnobState.MOD_RED:
             q.put(Adjustment(colour=Colour(red=5)))
         elif knobState == KnobState.MOD_GREEN:
@@ -493,7 +526,7 @@ def counter_clockwise_rotation():
     if knobState == KnobState.DEFAULT:
         q.put(Adjustment(power=-10))
     else:
-        knobTimeout = datetime.utcnow() + timedelta(seconds = KNOB_TIMEOUT_SECONDS)
+        knobTimeout = datetime.utcnow() + timedelta(seconds=KNOB_TIMEOUT_SECONDS)
         if knobState == KnobState.MOD_RED:
             q.put(Adjustment(colour=Colour(red=-5)))
         elif knobState == KnobState.MOD_GREEN:
@@ -513,3 +546,4 @@ button.when_held = button_held
 button.when_released = button_released
 rotor.when_rotated_clockwise = clockwise_rotation
 rotor.when_rotated_counter_clockwise = counter_clockwise_rotation
+
